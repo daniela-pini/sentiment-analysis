@@ -1,0 +1,108 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Sentiment Analysis — Pipeline ALTERNATIVA: Canary Deployment
+//
+// Strategia alternativa a blue/green: invece di switchare il 100% del traffico
+// in un colpo solo, si instrada gradualmente una percentuale crescente di
+// richieste verso la nuova versione, monitorando le metriche tra uno step e
+// l'altro.
+//
+// Passi tipici di un canary:
+//   1. Deploy della nuova versione affiancata alla vecchia
+//   2. Instradare il 10% del traffico verso la nuova versione
+//   3. Attendere N minuti e verificare error rate / latenza
+//   4. Se OK → 50% → attesa → verifica
+//   5. Se OK → 100% → fine
+//   6. Se in qualsiasi step le metriche peggiorano → rollback automatico
+//
+// IMPLEMENTAZIONE: per ottenere lo split percentuale serve un load balancer
+// con weighted routing (in nginx OSS si simula con il modulo `split_clients`,
+// più solido con Traefik / Envoy / Istio o un service mesh).
+//
+// Questo file è fornito a SCOPO ILLUSTRATIVO: il job Jenkins di default usa
+// il `Jenkinsfile` principale (blue/green). Per attivarlo, configurare il
+// Script Path su `jenkins/Jenkinsfile.canary` nel job.
+// ─────────────────────────────────────────────────────────────────────────────
+
+pipeline {
+    agent any
+
+    environment {
+        IMAGE_NAME   = "sentiment-api"
+        IMAGE_TAG    = "${env.BUILD_NUMBER}"
+        PROD_PORT    = "8001"
+        // Soglie di rollback automatico
+        MAX_ERROR_RATE = "0.05"        // 5%
+        MAX_P95_LATENCY = "1.0"        // secondi
+    }
+
+    stages {
+
+        stage("Build & Test") {
+            steps {
+                echo "Build, unit tests, integration tests, docker build..."
+                // ... (identico al Jenkinsfile principale)
+            }
+        }
+
+        stage("Deploy Canary (10% traffic)") {
+            steps {
+                echo "Deploying canary version with 10% traffic weight"
+                sh """
+                    # Avvia la nuova versione affiancata alla "stable"
+                    docker compose --profile production up -d sentiment-api-canary
+
+                    # Aggiorna nginx.conf con split_clients 10/90
+                    ./scripts/canary-traffic-split.sh 10
+                    docker exec nginx-prod nginx -s reload
+                """
+            }
+        }
+
+        stage("Monitor Canary (10%)") {
+            steps {
+                echo "Monitoring canary metrics for 5 minutes..."
+                script {
+                    sleep(time: 5, unit: "MINUTES")
+                    def errorRate = sh(
+                        script: "curl -s 'http://prometheus:9090/api/v1/query?query=rate(sentiment_api_prediction_errors_total{color=\"canary\"}[5m])' | jq -r '.data.result[0].value[1] // \"0\"'",
+                        returnStdout: true
+                    ).trim()
+                    if (errorRate.toFloat() > env.MAX_ERROR_RATE.toFloat()) {
+                        error("Canary error rate too high: ${errorRate} > ${env.MAX_ERROR_RATE}")
+                    }
+                    echo "✓ Canary metrics OK (error rate ${errorRate})"
+                }
+            }
+        }
+
+        stage("Promote Canary to 50%") {
+            steps {
+                input message: "Promote canary to 50% traffic?", ok: "Promote"
+                sh "./scripts/canary-traffic-split.sh 50 && docker exec nginx-prod nginx -s reload"
+            }
+        }
+
+        stage("Monitor Canary (50%)") {
+            steps {
+                script {
+                    sleep(time: 5, unit: "MINUTES")
+                    // ... stesso pattern di check su Prometheus
+                }
+            }
+        }
+
+        stage("Full rollout (100%)") {
+            steps {
+                input message: "Promote canary to 100% (full rollout)?", ok: "Promote"
+                sh "./scripts/canary-traffic-split.sh 100 && docker exec nginx-prod nginx -s reload"
+            }
+        }
+    }
+
+    post {
+        failure {
+            echo "❌ Rollback automatico: ripristino traffico 100% versione stabile"
+            sh "./scripts/canary-traffic-split.sh 0 && docker exec nginx-prod nginx -s reload"
+        }
+    }
+}

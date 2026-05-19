@@ -1,0 +1,52 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Custom Jenkins image per il progetto Sentiment Analysis
+#
+# Estende l'immagine ufficiale Jenkins LTS aggiungendo:
+#   - Python 3 + pip + venv  → per eseguire pytest negli stage Setup/Test
+#   - Docker CLI (statico)   → per eseguire `docker build` / `docker compose`
+#                              dagli stage di build e deploy. Il docker daemon
+#                              vero gira sull'host (Docker Desktop); il CLI nel
+#                              container Jenkins comunica con esso tramite il
+#                              socket /var/run/docker.sock montato nel
+#                              docker-compose.yml. Pattern noto come
+#                              "Docker outside of Docker" (DooD).
+#   - Docker Compose plugin  → per eseguire `docker compose ...` dai job
+#   - curl                   → usato dagli smoke test del Jenkinsfile
+#
+# NOTA: si installa solo il CLI statico ufficiale di Docker (binari estratti
+# dal tarball download.docker.com), non il pacchetto docker.io di Debian che
+# trascina dipendenze inutili (daemon, containerd, runc).
+# ─────────────────────────────────────────────────────────────────────────────
+
+FROM jenkins/jenkins:lts-jdk17
+
+USER root
+
+ARG DOCKER_VERSION=27.4.1
+ARG COMPOSE_VERSION=2.32.1
+
+# Python + curl
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 \
+        python3-pip \
+        python3-venv \
+        curl \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Docker CLI (binary statico ufficiale)
+RUN curl -fsSL "https://download.docker.com/linux/static/stable/x86_64/docker-${DOCKER_VERSION}.tgz" \
+        -o /tmp/docker.tgz \
+    && tar -xzf /tmp/docker.tgz -C /tmp \
+    && mv /tmp/docker/docker /usr/local/bin/docker \
+    && chmod +x /usr/local/bin/docker \
+    && rm -rf /tmp/docker /tmp/docker.tgz
+
+# Docker Compose plugin (binary v2)
+RUN mkdir -p /usr/local/lib/docker/cli-plugins \
+    && curl -fsSL "https://github.com/docker/compose/releases/download/v${COMPOSE_VERSION}/docker-compose-linux-x86_64" \
+        -o /usr/local/lib/docker/cli-plugins/docker-compose \
+    && chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+
+# Sanity check: il build fallisce subito se uno dei due tool manca
+RUN docker --version && docker compose version && python3 --version

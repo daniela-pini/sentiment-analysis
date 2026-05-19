@@ -1,0 +1,111 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Prometheus Alert Rules — Sentiment Analysis API
+#
+# Regole di allerta sulle metriche esposte da /metrics. Suddivise per gravità:
+#   - critical: incidente in atto, intervento immediato
+#   - warning:  segnale di degrado, da osservare
+#
+# In un setup completo queste regole verrebbero consumate da Alertmanager
+# che si occupa di routing (Slack, PagerDuty, email), grouping, silencing,
+# inibizioni. Per il progetto, le regole sono caricate da Prometheus e
+# visibili dalla UI in http://localhost:9090/alerts
+# ─────────────────────────────────────────────────────────────────────────────
+
+groups:
+
+  - name: sentiment-api-availability
+    interval: 30s
+    rules:
+
+      - alert: SentimentAPIDown
+        expr: up{job="sentiment-api"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: sentiment-api
+        annotations:
+          summary: "Sentiment API is DOWN ({{ $labels.instance }})"
+          description: "{{ $labels.instance }} is not responding to Prometheus scraping for over 1 minute."
+
+  - name: sentiment-api-performance
+    interval: 30s
+    rules:
+
+      - alert: HighP95Latency
+        expr: |
+          histogram_quantile(0.95,
+            rate(sentiment_api_request_latency_seconds_bucket[2m])
+          ) > 1.0
+        for: 2m
+        labels:
+          severity: warning
+          service: sentiment-api
+        annotations:
+          summary: "High p95 latency on Sentiment API"
+          description: "p95 latency over 1s for 2 minutes (current: {{ $value }}s)."
+
+      - alert: VeryHighP95Latency
+        expr: |
+          histogram_quantile(0.95,
+            rate(sentiment_api_request_latency_seconds_bucket[2m])
+          ) > 2.0
+        for: 2m
+        labels:
+          severity: critical
+          service: sentiment-api
+        annotations:
+          summary: "VERY high p95 latency on Sentiment API"
+          description: "p95 latency over 2s for 2 minutes (current: {{ $value }}s). User experience seriously impacted."
+
+  - name: sentiment-api-errors
+    interval: 30s
+    rules:
+
+      - alert: HighErrorRate
+        expr: |
+          (
+            rate(sentiment_api_prediction_errors_total[2m])
+            /
+            (rate(sentiment_api_requests_total[2m]) + rate(sentiment_api_prediction_errors_total[2m]))
+          ) > 0.05
+        for: 2m
+        labels:
+          severity: critical
+          service: sentiment-api
+        annotations:
+          summary: "Error rate above 5% on Sentiment API"
+          description: "Error rate {{ $value | humanizePercentage }} for the last 2 minutes."
+
+  - name: sentiment-api-resources
+    interval: 30s
+    rules:
+
+      - alert: HighCPUUsage
+        expr: sentiment_api_cpu_usage_percent > 90
+        for: 1m
+        labels:
+          severity: critical
+          service: sentiment-api
+        annotations:
+          summary: "Sentiment API CPU usage critical"
+          description: "CPU usage above 90% for 1 minute (current: {{ $value }}%)."
+
+      - alert: ElevatedCPUUsage
+        expr: sentiment_api_cpu_usage_percent > 70
+        for: 5m
+        labels:
+          severity: warning
+          service: sentiment-api
+        annotations:
+          summary: "Sentiment API CPU usage elevated"
+          description: "CPU usage above 70% for 5 minutes (current: {{ $value }}%)."
+
+      - alert: HighMemoryUsage
+        expr: sentiment_api_memory_usage_bytes > 500000000   # 500 MB
+        for: 5m
+        labels:
+          severity: warning
+          service: sentiment-api
+        annotations:
+          summary: "Sentiment API memory usage elevated"
+          description: "Memory usage above 500MB for 5 minutes (current: {{ $value | humanize1024 }}B)."

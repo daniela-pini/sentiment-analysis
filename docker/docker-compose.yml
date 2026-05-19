@@ -1,0 +1,179 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Architettura degli ambienti
+#
+# 1. STAGING (auto-deploy, Continuous Deployment)
+#    - service `sentiment-api-staging` → http://localhost:8000
+#    - Aggiornato automaticamente dalla pipeline Jenkins ad ogni push su main.
+#
+# 2. PRODUCTION (manual approval gate, Continuous Delivery)
+#    Implementa una strategia BLUE/GREEN:
+#    - `sentiment-api-blue`  → backend interno colorato "blue"
+#    - `sentiment-api-green` → backend interno colorato "green"
+#    - `nginx-prod` (porta 8001) è il reverse proxy: instrada il traffico solo
+#      verso il colore "attivo", configurato in monitoring/nginx/nginx.conf.
+#    Il deploy in produzione (vedi Jenkinsfile) ricarica la nuova versione sul
+#    colore inattivo, esegue smoke test, attende l'approval e infine cambia
+#    il colore "live" in nginx → switch atomico, zero downtime, rollback rapido.
+#
+# Profili Docker Compose:
+#   `docker compose up -d`                              → staging + monitoring
+#   `docker compose --profile production up -d`         → tutto + blue/green
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Sentiment Analysis API — STAGING ───────────────────────────────────────
+  sentiment-api-staging:
+    build:
+      context: ../app
+      dockerfile: ../docker/Dockerfile
+    image: sentiment-api:latest
+    container_name: sentiment-api-staging
+    ports:
+      - "8000:8000"
+    environment:
+      - MODEL_PATH=sentimentanalysismodel.pkl
+      - ENVIRONMENT=staging
+      - DEPLOYMENT_COLOR=staging
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - monitoring
+
+  # ── Sentiment Analysis API — PRODUCTION BLUE ───────────────────────────────
+  sentiment-api-blue:
+    image: sentiment-api:latest
+    container_name: sentiment-api-blue
+    environment:
+      - MODEL_PATH=sentimentanalysismodel.pkl
+      - ENVIRONMENT=production
+      - DEPLOYMENT_COLOR=blue
+    # Nessun port mapping: il traffico passa solo da nginx-prod
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - monitoring
+    profiles:
+      - production
+
+  # ── Sentiment Analysis API — PRODUCTION GREEN ──────────────────────────────
+  sentiment-api-green:
+    image: sentiment-api:latest
+    container_name: sentiment-api-green
+    environment:
+      - MODEL_PATH=sentimentanalysismodel.pkl
+      - ENVIRONMENT=production
+      - DEPLOYMENT_COLOR=green
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - monitoring
+    profiles:
+      - production
+
+  # ── Nginx reverse proxy per la produzione ──────────────────────────────────
+  # È l'unico ingresso pubblico dell'ambiente production.
+  # Il file nginx.conf montato definisce verso quale "colore" instradare:
+  # cambiare colore = modificare il file e fare `nginx -s reload`.
+  nginx-prod:
+    image: nginx:alpine
+    container_name: nginx-prod
+    ports:
+      - "8001:80"
+    volumes:
+      - ../monitoring/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - sentiment-api-blue
+      - sentiment-api-green
+    restart: unless-stopped
+    networks:
+      - monitoring
+    profiles:
+      - production
+
+  # ── Prometheus ─────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: prometheus
+    volumes:
+      - ../monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../monitoring/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports:
+      - "9090:9090"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=15d"
+      - "--web.enable-lifecycle"
+    restart: unless-stopped
+    networks:
+      - monitoring
+
+  # ── Grafana ────────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:11.3.1
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin123
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ../monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    networks:
+      - monitoring
+
+  # ── Jenkins ────────────────────────────────────────────────────────────────
+  # Costruito da Dockerfile.jenkins per includere Python 3 e Docker CLI,
+  # entrambi necessari agli stage della pipeline (test e build immagine).
+  # Il docker daemon vero gira sull'host (Docker Desktop); il CLI dentro
+  # Jenkins ci parla via il socket /var/run/docker.sock montato qui sotto.
+  #
+  # NOTA: la porta host è 8090 (e non la 8080 standard di Jenkins) per evitare
+  # conflitti con altri processi Java già attivi sulla 8080 (es. un'altra
+  # istanza di Jenkins/Tomcat, IDE in modalità server, IIS, ecc.).
+  # Il mapping è "porta_host:porta_container": dentro al container Jenkins
+  # continua ad ascoltare sulla 8080, ma dall'esterno lo raggiungi su :8090.
+  # Se sulla tua macchina la 8080 è libera, puoi tornare a "8080:8080".
+  jenkins:
+    build:
+      context: .
+      dockerfile: Dockerfile.jenkins
+    image: sentiment-jenkins:latest
+    container_name: jenkins
+    ports:
+      - "8090:8080"
+      - "50000:50000"
+    volumes:
+      - jenkins-data:/var/jenkins_home
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+    networks:
+      - monitoring
+
+volumes:
+  grafana-data:
+  jenkins-data:
+
+networks:
+  monitoring:
+    driver: bridge

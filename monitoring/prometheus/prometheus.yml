@@ -1,0 +1,39 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    monitor: "sentiment-analysis-monitor"
+
+# ── Alert rules ──────────────────────────────────────────────────────────────
+# Le regole definite in alerts.yml vengono valutate ogni evaluation_interval.
+# Visibili in http://localhost:9090/alerts
+# In un setup di produzione, andrebbero notificate via Alertmanager (Slack,
+# PagerDuty, email). Per semplicità di setup demo, qui ci si limita alle
+# regole; integrare Alertmanager è uno step aggiuntivo standardizzato.
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+# ── Scrape targets ───────────────────────────────────────────────────────────
+scrape_configs:
+
+  # Prometheus self-monitoring
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # Sentiment Analysis API — scrapa tutti gli ambienti.
+  # I container production (blue/green) sono raggiungibili sulla rete docker
+  # `monitoring` via il loro nome; quello di staging idem.
+  # Le metriche includono già le label `environment` e `color` quindi i grafici
+  # Grafana possono distinguere staging vs production e blue vs green.
+  - job_name: "sentiment-api"
+    metrics_path: "/metrics"
+    scrape_interval: 10s
+    static_configs:
+      - targets:
+          - "sentiment-api-staging:8000"
+          - "sentiment-api-blue:8000"
+          - "sentiment-api-green:8000"
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance

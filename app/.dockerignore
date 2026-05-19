@@ -1,0 +1,46 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# .dockerignore — esclude file dal contesto di build dell'immagine API.
+#
+# Quando Docker costruisce l'immagine, di default invia al daemon TUTTI i file
+# presenti nella cartella di build context (app/). Questo file dice "ignora
+# queste cose": rende la build più veloce, l'immagine più leggera, ed evita
+# che file generati localmente (es. un virtual environment creato per
+# sviluppo) finiscano dentro l'immagine.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Virtual environments
+venv/
+env/
+.venv/
+ENV/
+
+# Python cache e bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# Test cache e coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+reports/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+
+# Documentazione (non serve dentro l'immagine)
+*.md

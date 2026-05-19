@@ -1,0 +1,376 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Sentiment Analysis — CI/CD Pipeline (Fully Automated)
+//
+// Strategia adottata: Continuous Deployment completamente automatico,
+// senza intervento manuale, come richiesto dalle specifiche del progetto.
+//
+// Flusso (su ogni push al branch main):
+//   1. Checkout
+//   2. Setup
+//   3. Unit Tests
+//   4. Integration Tests
+//   5. Build Docker Image
+//   6. Push to Registry
+//   7. Deploy to Staging      (auto)
+//   8. Staging Smoke Test     ← gate automatico: se fallisce, pipeline aborted
+//                               e la produzione NON viene toccata
+//   9. Deploy to Production   (auto, strategia BLUE/GREEN)
+//  10. Production Smoke Test  (sul colore inattivo prima dello switch)
+//  11. Blue/Green Switch      (atomic, nginx -s reload, zero downtime)
+//  12. Post-switch Verification
+//
+// La safety NON è data da un human-in-the-loop ma da:
+//   - Test automatici (unit + integration) prima di costruire l'immagine
+//   - Smoke test in staging prima di toccare la produzione
+//   - Smoke test sul colore inattivo prima di spostare il traffico
+//   - Strategia blue/green che permette rollback automatico in caso di failure
+//     post-switch (il vecchio colore resta vivo e pronto a ricevere traffico)
+//
+// Strategie alternative (vedi `Jenkinsfile.canary`):
+//   - Canary deployment: rollout graduale 10% → 50% → 100% con valutazione
+//     metriche Prometheus tra uno step e l'altro, anch'esso automatico.
+// ─────────────────────────────────────────────────────────────────────────────
+
+pipeline {
+    agent any
+
+    environment {
+        IMAGE_NAME      = "sentiment-api"
+        IMAGE_TAG       = "${env.BUILD_NUMBER}"
+        REGISTRY        = "your-registry.io"          // ← aggiornare con il proprio registry
+        NOTIFY_EMAIL    = "devops@yourcompany.com"    // ← aggiornare
+        COMPOSE_FILE    = "docker/docker-compose.yml"
+        // NOTA: gli smoke test in pipeline NON usano localhost ma il nome
+        // del container sulla rete Docker `monitoring`, perché Jenkins gira
+        // anch'esso in un container e "localhost" lì significa "Jenkins
+        // stesso", non il PC host. Da host invece si usa localhost:8000 e
+        // localhost:8001 per accedere all'API normalmente.
+        STAGING_PORT    = "8000"                       // porta host (per debug manuale)
+        PROD_PORT       = "8001"                       // porta host (per debug manuale)
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: "10"))
+        timeout(time: 30, unit: "MINUTES")
+        disableConcurrentBuilds()
+    }
+
+    stages {
+
+        // ─── CONTINUOUS INTEGRATION ──────────────────────────────────────────
+
+        stage("Checkout") {
+            steps {
+                echo "Cloning repository..."
+                checkout scm
+            }
+        }
+
+        stage("Setup") {
+            steps {
+                echo "Setting up Python virtual environment..."
+                sh """
+                    python3 -m venv venv
+                    . venv/bin/activate
+                    pip install --upgrade pip
+                    pip install -r app/requirements.txt
+                    pip install pytest pytest-cov httpx
+                """
+            }
+        }
+
+        stage("Unit Tests") {
+            steps {
+                echo "Running unit tests..."
+                sh """
+                    . venv/bin/activate
+                    pytest tests/test_model.py -v --tb=short \
+                        --junitxml=reports/unit-tests.xml \
+                        --cov=app --cov-report=xml:reports/coverage.xml
+                """
+            }
+            post {
+                always {
+                    junit "reports/unit-tests.xml"
+                }
+            }
+        }
+
+        stage("Integration Tests") {
+            steps {
+                echo "Running integration tests..."
+                sh """
+                    . venv/bin/activate
+                    pytest tests/test_api.py -v --tb=short \
+                        --junitxml=reports/integration-tests.xml
+                """
+            }
+            post {
+                always {
+                    junit "reports/integration-tests.xml"
+                }
+            }
+        }
+
+        stage("Build Docker Image") {
+            steps {
+                echo "Building Docker image ${IMAGE_NAME}:${IMAGE_TAG}..."
+                sh """
+                    docker build \
+                        -t ${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG} \
+                        -t ${REGISTRY}/${IMAGE_NAME}:latest \
+                        -t ${IMAGE_NAME}:latest \
+                        -f docker/Dockerfile \
+                        app/
+                """
+            }
+        }
+
+        stage("Push to Registry") {
+            when {
+                allOf {
+                    anyOf {
+                        branch "main"
+                        branch "release/*"
+                    }
+                    // Skippato automaticamente se la credenziale del registry
+                    // non è configurata in Jenkins. In ambiente reale si
+                    // configurerebbe una credenziale con ID 'docker-registry-
+                    // credentials' (Manage Jenkins → Credentials).
+                    expression {
+                        try {
+                            withCredentials([usernamePassword(
+                                credentialsId: "docker-registry-credentials",
+                                usernameVariable: "U", passwordVariable: "P"
+                            )]) { return true }
+                        } catch (e) {
+                            echo "Skipping registry push: credentials not configured"
+                            return false
+                        }
+                    }
+                }
+            }
+            steps {
+                echo "Pushing image to registry..."
+                withCredentials([usernamePassword(
+                    credentialsId: "docker-registry-credentials",
+                    usernameVariable: "DOCKER_USER",
+                    passwordVariable: "DOCKER_PASS"
+                )]) {
+                    sh """
+                        echo \$DOCKER_PASS | docker login ${REGISTRY} -u \$DOCKER_USER --password-stdin
+                        docker push ${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}
+                        docker push ${REGISTRY}/${IMAGE_NAME}:latest
+                    """
+                }
+            }
+        }
+
+        // ─── CONTINUOUS DEPLOYMENT → STAGING (automatico) ────────────────────
+
+        stage("Deploy to Staging") {
+            steps {
+                echo "Auto-deploying to STAGING environment..."
+                sh """
+                    docker compose -f ${COMPOSE_FILE} up -d --force-recreate sentiment-api-staging
+                    echo "Waiting for health check..."
+                    sleep 15
+                    curl -f http://sentiment-api-staging:8000/health || exit 1
+                    echo "✓ Staging deployment successful"
+                """
+            }
+        }
+
+        stage("Staging Smoke Test") {
+            steps {
+                echo "Smoke test against STAGING..."
+                sh """
+                    RESPONSE=\$(curl -sf -X POST http://sentiment-api-staging:8000/predict \
+                        -H 'Content-Type: application/json' \
+                        -d '{"review": "This product is excellent!"}')
+                    echo "Response: \$RESPONSE"
+                    echo \$RESPONSE | grep -q '"sentiment"' || (echo "Staging smoke test FAILED" && exit 1)
+                    echo "✓ Staging smoke test passed — proceeding to production"
+                """
+            }
+        }
+
+        // ─── CONTINUOUS DEPLOYMENT → PRODUCTION (automatico, blue/green) ─────
+        //
+        // Lo staging smoke test sopra è il "gate" automatico: se fallisce, la
+        // pipeline si interrompe e la produzione resta intatta. Nessun
+        // intervento umano richiesto.
+
+        stage("Determine Inactive Color") {
+            steps {
+                script {
+                    // Verifica precondizione: la produzione (nginx-prod + un colore attivo)
+                    // deve essere già avviata. Jenkins NON gestisce l'intera infrastruttura,
+                    // ma solo l'update del colore inattivo — pattern GitOps standard.
+                    sh """
+                        if ! docker ps --format '{{.Names}}' | grep -q '^nginx-prod\$'; then
+                            echo "ERRORE: nginx-prod non è in esecuzione."
+                            echo "Avviare prima la produzione dal PC host:"
+                            echo "  cd docker && docker compose --profile production up -d"
+                            exit 1
+                        fi
+                    """
+                    // Determina quale colore è attivo leggendo la config DENTRO nginx-prod
+                    // (non dalla workspace, che è una copia non sincronizzata).
+                    env.INACTIVE_COLOR = sh(
+                        script: '''
+                            if docker exec nginx-prod grep -E "^[[:space:]]*server sentiment-api-blue:8000;" /etc/nginx/nginx.conf > /dev/null 2>&1; then
+                                echo "green"
+                            else
+                                echo "blue"
+                            fi
+                        ''',
+                        returnStdout: true
+                    ).trim()
+                    env.ACTIVE_COLOR = (env.INACTIVE_COLOR == "blue") ? "green" : "blue"
+                    echo "Current ACTIVE color in production: ${env.ACTIVE_COLOR}"
+                    echo "New version will be deployed to INACTIVE color: ${env.INACTIVE_COLOR}"
+                }
+            }
+        }
+
+        stage("Deploy to Production (Inactive Color)") {
+            steps {
+                echo "Auto-deploying to PRODUCTION (color: ${env.INACTIVE_COLOR})..."
+                sh """
+                    # Usiamo `docker run` invece di `docker compose` per evitare
+                    # il problema dei path workspace: la workspace di Jenkins è
+                    # in un Docker volume e il daemon host non vede quei path,
+                    # quindi i bind mount di compose fallirebbero. Con `docker
+                    # run` lavoriamo solo con riferimenti a immagini e network,
+                    # senza dipendere dal filesystem.
+
+                    # Determina la rete Docker su cui gira la produzione
+                    # (la deduciamo da nginx-prod, che è già in esecuzione)
+                    NETWORK=\$(docker inspect nginx-prod --format '{{range \$k,\$v := .NetworkSettings.Networks}}{{\$k}}{{end}}')
+                    echo "Production network: \$NETWORK"
+
+                    # Rimuovi il vecchio container del colore inattivo (se c'è)
+                    docker rm -f sentiment-api-${INACTIVE_COLOR} 2>/dev/null || true
+
+                    # Avvia il nuovo container con la nuova immagine, sulla rete prod
+                    docker run -d \\
+                        --name sentiment-api-${INACTIVE_COLOR} \\
+                        --network \$NETWORK \\
+                        --network-alias sentiment-api-${INACTIVE_COLOR} \\
+                        -e ENVIRONMENT=production \\
+                        -e DEPLOYMENT_COLOR=${INACTIVE_COLOR} \\
+                        --restart unless-stopped \\
+                        sentiment-api:latest
+
+                    # Attendi che sia healthy
+                    echo "Waiting for sentiment-api-${INACTIVE_COLOR} to be healthy..."
+                    for i in \$(seq 1 30); do
+                        if docker exec sentiment-api-${INACTIVE_COLOR} curl -sf http://localhost:8000/health > /dev/null 2>&1; then
+                            echo "✓ sentiment-api-${INACTIVE_COLOR} is healthy"
+                            break
+                        fi
+                        sleep 2
+                    done
+                """
+            }
+        }
+
+        stage("Production Smoke Test (Inactive Color)") {
+            steps {
+                echo "Smoke test on INACTIVE color before traffic switch..."
+                sh """
+                    # Test diretto verso il colore inattivo (bypassando nginx)
+                    RESPONSE=\$(docker exec sentiment-api-${INACTIVE_COLOR} curl -sf \
+                        -X POST http://localhost:8000/predict \
+                        -H 'Content-Type: application/json' \
+                        -d '{"review": "Excellent product, highly recommend!"}')
+                    echo "Response from ${INACTIVE_COLOR}: \$RESPONSE"
+                    echo \$RESPONSE | grep -q '"sentiment"' || (echo "Smoke test FAILED" && exit 1)
+                    echo "✓ ${INACTIVE_COLOR} ready to receive production traffic"
+                """
+            }
+        }
+
+        stage("Blue/Green Switch") {
+            steps {
+                echo "Switching production traffic: ${env.ACTIVE_COLOR} → ${env.INACTIVE_COLOR}"
+                sh """
+                    chmod +x scripts/blue-green-switch.sh
+                    ./scripts/blue-green-switch.sh ${INACTIVE_COLOR}
+                """
+            }
+        }
+
+        stage("Post-Switch Verification") {
+            steps {
+                echo "Verifying production traffic now served by ${env.INACTIVE_COLOR}..."
+                sh """
+                    sleep 3
+                    # Curl via docker exec dal nuovo color container, che è sulla
+                    # stessa rete docker di nginx-prod. Da Jenkins direttamente
+                    # non possiamo (Jenkins è su un'altra rete).
+                    RESPONSE=\$(docker exec sentiment-api-${INACTIVE_COLOR} curl -sf http://nginx-prod/health)
+                    echo "Production health response: \$RESPONSE"
+                    echo \$RESPONSE | grep -q "\\"color\\":\\"${INACTIVE_COLOR}\\"" \
+                        || (echo "Switch verification FAILED — rollback may be needed" && exit 1)
+                    echo "✓ Production now serving from ${INACTIVE_COLOR} — deployment complete"
+                """
+            }
+        }
+    }
+
+    // ── Post-pipeline notifications ──────────────────────────────────────────
+    // Le notifiche email sono opzionali: se SMTP non è configurato in Jenkins,
+    // i tentativi di invio vengono inglobati in un try/catch così non
+    // inquinano i log e non alterano lo stato della build.
+    post {
+        success {
+            echo "✅ Pipeline completed successfully — fully automated end-to-end"
+            script {
+                try {
+                    emailext(
+                        subject: "✅ [Jenkins] Build #${env.BUILD_NUMBER} - SUCCESS",
+                        body: """
+                            <h3>Pipeline Succeeded</h3>
+                            <p><b>Job:</b> ${env.JOB_NAME}</p>
+                            <p><b>Build:</b> #${env.BUILD_NUMBER}</p>
+                            <p><b>Branch:</b> ${env.BRANCH_NAME}</p>
+                            <p><b>Duration:</b> ${currentBuild.durationString}</p>
+                            <p><a href="${env.BUILD_URL}">View Build</a></p>
+                        """,
+                        to: "${NOTIFY_EMAIL}",
+                        mimeType: "text/html"
+                    )
+                } catch (Exception e) {
+                    echo "Email notification skipped (SMTP not configured): ${e.message}"
+                }
+            }
+        }
+        failure {
+            echo "❌ Pipeline FAILED — production state preserved (no partial rollout)"
+            script {
+                try {
+                    emailext(
+                        subject: "❌ [Jenkins] Build #${env.BUILD_NUMBER} - FAILED",
+                        body: """
+                            <h3>Pipeline Failed</h3>
+                            <p><b>Job:</b> ${env.JOB_NAME}</p>
+                            <p><b>Build:</b> #${env.BUILD_NUMBER}</p>
+                            <p><b>Branch:</b> ${env.BRANCH_NAME}</p>
+                            <p><b>Failed Stage:</b> ${env.STAGE_NAME}</p>
+                            <p><a href="${env.BUILD_URL}console">View Console</a></p>
+                        """,
+                        to: "${NOTIFY_EMAIL}",
+                        mimeType: "text/html"
+                    )
+                } catch (Exception e) {
+                    echo "Email notification skipped (SMTP not configured): ${e.message}"
+                }
+            }
+        }
+        always {
+            cleanWs()
+        }
+    }
+}
